@@ -1,0 +1,185 @@
+# Runehall Max AIO v8 — staging-only authorized scan
+# SAFE MODE: RUN_STATEFUL stays false. No secrets committed.
+# Manual dispatch, PR, or push to the harness. Never targets production.
+name: aio-scan-staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      skip_playwright:
+        description: "Skip Playwright SPA crawl (AIO_SKIP_PLAYWRIGHT)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      phases:
+        description: "Phases to run (comma-separated: recon,passive,active_safe,stateful,all)"
+        required: false
+        default: "recon,passive,active_safe"
+        type: string
+      http2:
+        description: "Use HTTP/2 transport (AIO_HTTP2)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+  pull_request:
+    paths:
+      - ".github/workflows/aio-scan.yml"
+      - "max_aio_v8.py"
+      - "runehall-aio/max_aio_v8.py"
+  push:
+    paths:
+      - ".github/workflows/aio-scan.yml"
+      - "max_aio_v8.py"
+      - "runehall-aio/max_aio_v8.py"
+
+permissions:
+  contents: read
+  security-events: write   # SARIF upload to code scanning
+  pull-requests: write     # post PR-comment summary (PR events only)
+
+jobs:
+  staging-scan:
+    name: Max AIO v8 (staging, safe mode)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Domain guard still forces staging; do not override to production.
+      AIO_TARGET_URL: https://staging.runehall.com
+      AIO_AUTHORIZED: "true"
+      # HARD: safe mode in CI — never flip this to true in the workflow file.
+      AIO_RUN_STATEFUL: "false"
+      AIO_ENABLE_ZAP: "false"
+      AIO_SKIP_PLAYWRIGHT: ${{ github.event.inputs.skip_playwright || 'false' }}
+      AIO_PHASES: ${{ github.event.inputs.phases || 'recon,passive,active_safe' }}
+      AIO_HTTP2: ${{ github.event.inputs.http2 || 'false' }}
+      AIO_OUTPUT_PREFIX: max_aio_v8_report
+      AIO_HISTORY_FILE: max_aio_v8_history.json
+      # JWTs / endpoints come from GitHub Secrets (never commit them).
+      AIO_USER_A_JWT: ${{ secrets.AIO_USER_A_JWT }}
+      AIO_USER_B_JWT: ${{ secrets.AIO_USER_B_JWT }}
+      AIO_BET_ENDPOINT: ${{ secrets.AIO_BET_ENDPOINT }}
+      AIO_WITHDRAW_ENDPOINT: ${{ secrets.AIO_WITHDRAW_ENDPOINT }}
+      AIO_BALANCE_ENDPOINT: ${{ secrets.AIO_BALANCE_ENDPOINT }}
+      AIO_BONUS_ENDPOINT: ${{ secrets.AIO_BONUS_ENDPOINT }}
+      AIO_FREESPIN_ENDPOINT: ${{ secrets.AIO_FREESPIN_ENDPOINT }}
+      AIO_SEED_ENDPOINT: ${{ secrets.AIO_SEED_ENDPOINT }}
+      AIO_AUTH_TEST_ENDPOINT: ${{ secrets.AIO_AUTH_TEST_ENDPOINT }}
+      # Optional request signing for endpoints that require it.
+      AIO_SIGN_MODE: ${{ secrets.AIO_SIGN_MODE }}
+      AIO_SIGN_SECRET: ${{ secrets.AIO_SIGN_SECRET }}
+      AIO_APIKEY_VALUE: ${{ secrets.AIO_APIKEY_VALUE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests playwright 'httpx[http2]'
+
+      - name: Install Playwright Chromium
+        if: env.AIO_SKIP_PLAYWRIGHT != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      # Restore prior-run history so findings can be tagged new/existing/fixed.
+      - name: Restore AIO history (for new/fixed diffing)
+        uses: actions/cache@v4
+        with:
+          path: max_aio_v8_history.json
+          key: aio-history-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            aio-history-${{ github.ref_name }}-
+            aio-history-
+
+      - name: Guard — refuse non-staging target / stateful CI
+        run: |
+          echo "TARGET=$AIO_TARGET_URL"
+          echo "RUN_STATEFUL=$AIO_RUN_STATEFUL"
+          echo "PHASES=$AIO_PHASES"
+          case "$AIO_TARGET_URL" in
+            *staging.runehall.com*) echo "OK: staging target" ;;
+            *) echo "::error::Refusing non-staging AIO_TARGET_URL"; exit 1 ;;
+          esac
+          if [ "$AIO_RUN_STATEFUL" = "true" ] || [ "$AIO_RUN_STATEFUL" = "1" ]; then
+            echo "::error::CI safe mode forbids AIO_RUN_STATEFUL=true"
+            exit 1
+          fi
+          # Strip accidental stateful phase from CI dispatch
+          export AIO_PHASES="$(echo "$AIO_PHASES" | sed 's/stateful//g;s/,,/,/g;s/^,//;s/,$//')"
+          if [ -z "$AIO_PHASES" ]; then
+            export AIO_PHASES="recon,passive,active_safe"
+          fi
+          echo "PHASES_EFFECTIVE=$AIO_PHASES"
+          echo "AIO_PHASES=$AIO_PHASES" >> "$GITHUB_ENV"
+
+      - name: Run Max AIO v8 (safe mode)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set +e
+          if [ -f max_aio_v8.py ]; then
+            python max_aio_v8.py --phases "$AIO_PHASES"
+            code=$?
+          elif [ -f runehall-aio/max_aio_v8.py ]; then
+            cd runehall-aio && python max_aio_v8.py --phases "$AIO_PHASES"
+            code=$?
+          else
+            echo "::error::max_aio_v8.py not found"
+            exit 1
+          fi
+          # 0 = clean, 10 = CRITICAL/HIGH present — both are successful scan completions
+          if [ "$code" -eq 0 ] || [ "$code" -eq 10 ]; then
+            echo "Scan completed with exit $code"
+            exit 0
+          fi
+          echo "::error::Harness failed with exit $code"
+          exit "$code"
+
+      - name: Upload all report + CI-export artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: max-aio-v8-report
+          path: |
+            max_aio_v8_report.html
+            max_aio_v8_report.json
+            max_aio_v8_report.sarif
+            max_aio_v8_report.md
+            max_aio_v8_report.junit.xml
+            max_aio_v8_report.defectdojo.json
+            max_aio_v8_report.burp.xml
+            max_aio_v8_report.pr-comment.md
+            runehall-aio/max_aio_v8_report.*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish JUnit test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        continue-on-error: true
+        with:
+          report_paths: "**/max_aio_v8_report.junit.xml"
+
+      - name: Upload SARIF to GitHub code scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ github.workspace }}/max_aio_v8_report.sarif
+          category: runehall-max-aio-v8-staging
+
+      # Post the compact Markdown summary as a PR comment (PR events only).
+      - name: Post PR-comment summary
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: runehall-max-aio
+          path: max_aio_v8_report.pr-comment.md

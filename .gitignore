@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+max_aio_v*_report.*
+nuclei_out.json
+max_aio_v8_history.json
